@@ -208,60 +208,152 @@ function generateConversation() {
   return messages;
 }
 
-async function generateImage(messages, index) {
-  try {
-    // Randomly select theme and resolution
-    const theme = THEMES[Math.floor(Math.random() * THEMES.length)];
-    const resolution = RESOLUTIONS[index % RESOLUTIONS.length];
-    const fontSize = FONT_SIZES[Math.floor(Math.random() * FONT_SIZES.length)];
-    // Alternate between png and jpeg
-    const format = index % 2 === 0 ? "png" : "jpeg";
+async function generateImage(messages, index, maxRetries = 3) {
+  const backoffDelay = (attempt) =>
+    Math.min(1000 * Math.pow(2, attempt), 10000);
 
-    console.log(`\nGenerating conversation ${index + 1}`);
-    console.log(
-      `Theme: ${theme}, Format: ${format}, Resolution: ${resolution.width}x${resolution.height}@${resolution.scale}x`
-    );
-    console.log(
-      `Font size: ${fontSize.size}px, Line height: ${fontSize.lineHeight}`
-    );
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      // Randomly select theme and resolution
+      const theme = THEMES[Math.floor(Math.random() * THEMES.length)];
+      const resolution = RESOLUTIONS[index % RESOLUTIONS.length];
+      const fontSize =
+        FONT_SIZES[Math.floor(Math.random() * FONT_SIZES.length)];
+      // Alternate between png and jpeg
+      const format = index % 2 === 0 ? "png" : "jpeg";
 
-    const response = await fetch("http://localhost:3000/generate-image", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        title: `conversation-${index + 1}`,
-        messages,
-        theme,
-        format,
-        resolution,
-        fontSize,
-      }),
-    });
+      console.log(
+        `\nGenerating conversation ${index + 1} (attempt ${
+          attempt + 1
+        }/${maxRetries})`
+      );
+      console.log(
+        `Theme: ${theme}, Format: ${format}, Resolution: ${resolution.width}x${resolution.height}@${resolution.scale}x`
+      );
+      console.log(
+        `Font size: ${fontSize.size}px, Line height: ${fontSize.lineHeight}`
+      );
 
-    const result = await response.json();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
 
-    if (!result.success) {
-      throw new Error(`Failed to generate image: ${result.error}`);
+      try {
+        const response = await fetch("http://localhost:3000/generate-image", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: `conversation-${index + 1}`,
+            messages,
+            theme,
+            format,
+            resolution,
+            fontSize,
+          }),
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const result = await response.json();
+
+        if (!result.success) {
+          throw new Error(`Failed to generate image: ${result.error}`);
+        }
+
+        console.log(`✓ Generated conversation ${index + 1}`);
+        console.log(`  File: ${result.filename}`);
+        return { success: true, index };
+      } catch (error) {
+        clearTimeout(timeout);
+        throw error;
+      }
+    } catch (error) {
+      console.error(
+        `✗ Error generating conversation ${index + 1} (attempt ${
+          attempt + 1
+        }):`,
+        error
+      );
+
+      // If this was our last attempt, or if it's not a connection error, give up
+      if (
+        attempt === maxRetries - 1 ||
+        (error.code !== "ECONNREFUSED" && error.code !== "ECONNRESET")
+      ) {
+        return { success: false, index, error };
+      }
+
+      // Wait before retrying with exponential backoff
+      const delay = backoffDelay(attempt);
+      console.log(`Retrying in ${delay / 1000} seconds...`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
-
-    console.log(`✓ Generated conversation ${index + 1}`);
-    console.log(`  File: ${result.filename}`);
-  } catch (error) {
-    console.error(`✗ Error generating conversation ${index + 1}:`, error);
   }
 }
 
 async function generateRandomConversations(count = 150) {
   console.log(`Generating ${count} random conversations...`);
 
-  for (let i = 0; i < count; i++) {
-    const conversation = generateConversation();
-    await generateImage(conversation, i);
-    // Add a small delay between requests
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+  // Process in batches of 8 concurrent requests
+  const BATCH_SIZE = 8;
+  const results = {
+    success: 0,
+    failed: 0,
+    total: count,
+  };
+
+  for (let i = 0; i < count; i += BATCH_SIZE) {
+    const batchPromises = [];
+    const batchEnd = Math.min(i + BATCH_SIZE, count);
+
+    console.log(
+      `\nProcessing batch ${i / BATCH_SIZE + 1} (conversations ${
+        i + 1
+      }-${batchEnd})`
+    );
+
+    for (let j = i; j < batchEnd; j++) {
+      const conversation = generateConversation();
+      batchPromises.push(generateImage(conversation, j));
+    }
+
+    const batchResults = await Promise.all(batchPromises);
+
+    // Update statistics
+    const batchStats = batchResults.reduce(
+      (stats, result) => {
+        result.success ? stats.success++ : stats.failed++;
+        return stats;
+      },
+      { success: 0, failed: 0 }
+    );
+
+    results.success += batchStats.success;
+    results.failed += batchStats.failed;
+
+    // Log batch results
+    console.log(`\nBatch ${i / BATCH_SIZE + 1} complete:`);
+    console.log(`Success: ${batchStats.success}, Failed: ${batchStats.failed}`);
+    console.log(
+      `Overall progress: ${results.success + results.failed}/${count} (${
+        results.success
+      } successful, ${results.failed} failed)`
+    );
+
+    // Add delay between batches to prevent overwhelming the server
+    if (i + BATCH_SIZE < count) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
   }
 
   console.log("\nAll conversations generated!");
+  console.log(
+    `Final results: ${results.success} successful, ${results.failed} failed`
+  );
 }
 
 // Generate 150 random conversations
